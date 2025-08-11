@@ -1,0 +1,475 @@
+// src/server.ts
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcrypt';
+
+const server = Fastify({ logger: true });
+const prisma = new PrismaClient();
+const SALT_ROUNDS = 10;
+
+server.register(cors, { 
+    origin: '*', // In production, you would change this to your frontend's domain
+    methods: ['GET', 'POST', 'PUT', 'DELETE'], // Explicitly allow the DELETE method
+  });
+// --- NEW ANALYTICS ENDPOINT ---
+server.get('/dashboard/:userId/analytics', async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    try {
+        // 1. Fetch all collections for the user
+        const collections = await prisma.collection.findMany({
+            where: { userId },
+            include: {
+                _count: { select: { products: true, clicks: true, likedBy: true } },
+            },
+        });
+
+        // 2. Simulate time-series data for the main chart
+        // 2. Fetch real click data for the last 7 days
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+        const clicksByDay = await prisma.click.groupBy({
+            by: ['createdAt'],
+            where: {
+                collection: {
+                    userId: userId,
+                },
+                createdAt: {
+                    gte: sevenDaysAgo,
+                },
+            },
+            _count: {
+                id: true,
+            },
+            orderBy: {
+                createdAt: 'asc',
+            }
+        });
+
+        // Format the data for the chart
+        const dateMap = new Map<string, number>();
+        for (let i = 0; i < 7; i++) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            const key = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            dateMap.set(key, 0);
+        }
+
+        clicksByDay.forEach(row => {
+            const key = new Date(row.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            if (dateMap.has(key)) {
+                dateMap.set(key, (dateMap.get(key) || 0) + row._count.id);
+            }
+        });
+        
+        const clicksOverTime = Array.from(dateMap.entries()).map(([date, clicks]) => ({ date, clicks })).reverse();
+
+        // 3. Aggregate overall stats (simulated earnings/conversions)
+        const totalClicks = collections.reduce((sum, col) => sum + col._count.clicks, 0);
+        const totalEarnings = totalClicks * 0.25; // Simulate earnings based on clicks
+        const totalConversions = Math.floor(totalClicks / 20); // Simulate a 5% conversion rate
+
+        // 4. Format collection data for the table
+        const collectionsPerformance = collections.map(c => ({
+            id: c.id,
+            name: c.name,
+            clicks: c._count.clicks,
+            likes: c._count.likedBy,
+            shares: Math.floor(Math.random() * 100), // Simulated
+            earnings: c._count.clicks * 0.25, // Simulated
+        })).sort((a, b) => b.earnings - a.earnings);
+
+        reply.send({
+            summary: {
+                totalClicks,
+                totalEarnings,
+                totalConversions,
+                avgConversionRate: 5.12, // Mocked
+            },
+            clicksOverTime: last7Days,
+            topCollections: collectionsPerformance,
+        });
+
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching analytics data" });
+    }
+});
+// --- MOCK DATA FOR PRODUCT SEARCH ---
+const mockProducts = [
+  { id: 'prod_serum', name: 'Niacinamide 10% + Zinc 1%', imageUrl: 'https://placehold.co/600x800/E0E7FF/4F46E5?text=Serum', brand: 'The Ordinary', baseUrl: 'https://example.com/product1' },
+  { id: 'prod_cleanser', name: 'Hydrating Facial Cleanser', imageUrl: 'https://placehold.co/600x600/DBEAFE/1E40AF?text=Cleanser', brand: 'CeraVe', baseUrl: 'https://example.com/product2' },
+  { id: 'prod_sunscreen', name: 'Unseen Sunscreen SPF 40', imageUrl: 'https://placehold.co/600x700/FEF3C7/92400E?text=Sunscreen', brand: 'Supergoop!', baseUrl: 'https://example.com/product3' },
+  { id: 'prod_lipmask', name: 'Lip Sleeping Mask', imageUrl: 'https://placehold.co/600x600/FCE7F3/9D174D?text=Lip+Mask', brand: 'Laneige', baseUrl: 'https://example.com/product4' },
+  { id: 'prod_cream', name: 'Protini Polypeptide Cream', imageUrl: 'https://placehold.co/600x750/F0F9FF/0891B2?text=Cream', brand: 'Drunk Elephant', baseUrl: 'https://example.com/product5' },
+];
+
+// --- AUTHENTICATION ROUTES ---
+server.post('/register', async (request, reply) => {
+  const { email, password, username, role = 'CREATOR' } = request.body as any;
+  if (!email || !password || !username) return reply.code(400).send({ message: 'All fields are required.' });
+  try {
+    const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+    const newUser = await prisma.user.create({ data: { email, username, authProviderId: hashedPassword, role } });
+    const { authProviderId, ...userResponse } = newUser;
+    reply.code(201).send(userResponse);
+  } catch (error: any) {
+    if (error.code === 'P2002') reply.code(409).send({ message: 'User already exists.' });
+    else { server.log.error(error); reply.code(500).send({ message: 'Server error.' }); }
+  }
+});
+
+server.post('/login', async (request, reply) => {
+    const { email, password } = request.body as any;
+    if (!email || !password) return reply.code(400).send({ message: 'Email and password are required.' });
+    try {
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) return reply.code(401).send({ message: 'Invalid credentials.' });
+        const match = await bcrypt.compare(password, user.authProviderId);
+        if (!match) return reply.code(401).send({ message: 'Invalid credentials.' });
+        const { authProviderId, ...userResponse } = user;
+        reply.send(userResponse);
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: 'Server error.' }); }
+});
+
+server.put('/users/:userId/upgrade-to-creator', async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    const { fullName, phone, instagramHandle, profileImageUrl } = request.body as any;
+
+    try {
+        const updatedUser = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                role: 'CREATOR',
+                fullName,
+                phone,
+                instagramHandle,
+                profileImageUrl,
+            },
+        });
+        const { authProviderId, ...userResponse } = updatedUser;
+        reply.send(userResponse);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Could not upgrade user to creator." });
+    }
+});
+
+// --- SHOPPER ENGAGEMENT ROUTES ---
+server.post('/collections/:collectionId/like', async (request, reply) => {
+    const { collectionId } = request.params as { collectionId: string };
+    const { userId } = request.body as { userId: string };
+    if (!userId) return reply.code(400).send({ message: "User ID is required." });
+    try {
+        await prisma.userLikes.create({ data: { userId, collectionId } });
+        reply.code(201).send({ isLiked: true });
+    } catch (error: any) {
+        if (error.code === 'P2002') return reply.code(409).send({ message: "Already liked" });
+        server.log.error(error); reply.code(500).send({ message: "Server error" });
+    }
+});
+
+server.delete('/collections/:collectionId/unlike', async (request, reply) => {
+    const { collectionId } = request.params as { collectionId: string };
+    const { userId } = request.body as { userId: string };
+    if (!userId) return reply.code(400).send({ message: "User ID is required." });
+    try {
+        await prisma.userLikes.delete({ where: { userId_collectionId: { userId, collectionId } } });
+        reply.code(200).send({ isLiked: false });
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Could not unlike collection" }); }
+});
+server.post('/users/:creatorId/follow', async (request, reply) => {
+    const { creatorId } = request.params as { creatorId: string };
+    const { userId } = request.body as { userId: string }; // The user who is doing the following
+    try {
+        await prisma.follow.create({ data: { followerId: userId, followingId: creatorId } });
+        reply.code(201).send({ message: 'Followed successfully' });
+    } catch (error) { reply.code(500).send({ message: 'Error following user' }); }
+});
+// Add this new route to your server.ts file
+
+server.delete('/users/:creatorId/unfollow', async (request, reply) => {
+    const { creatorId } = request.params as { creatorId: string };
+    const { userId } = request.body as { userId: string }; // The user who is doing the unfollowing
+    
+    if (!userId) {
+        return reply.code(400).send({ message: "User ID is required." });
+    }
+
+    try {
+        await prisma.follow.delete({
+            where: {
+                followerId_followingId: {
+                    followerId: userId,
+                    followingId: creatorId,
+                },
+            },
+        });
+        reply.code(204).send(); // 204 No Content is standard for a successful DELETE
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Could not unfollow user." });
+    }
+});
+
+server.post('/collections/:collectionId/comments', async (request, reply) => {
+    const { collectionId } = request.params as { collectionId: string };
+    const { userId, text } = request.body as { userId: string, text: string };
+    try {
+        const comment = await prisma.comment.create({
+            data: { text, userId, collectionId },
+            include: { user: { select: { username: true, profileImageUrl: true } } }
+        });
+        reply.code(201).send(comment);
+    } catch (error) { reply.code(500).send({ message: 'Error posting comment' }); }
+});
+
+server.get('/users/:userId/liked-status/:collectionId', async (request, reply) => {
+    const { userId, collectionId } = request.params as { userId: string, collectionId: string };
+    try {
+        const like = await prisma.userLikes.findUnique({ where: { userId_collectionId: { userId, collectionId } } });
+        reply.send({ isLiked: !!like });
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching like status" }); }
+});
+
+server.get('/users/:userId/likes', async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    try {
+        const likedCollections = await prisma.userLikes.findMany({
+            where: { userId },
+            include: { 
+                collection: { 
+                    include: { 
+                        user: true, 
+                        products: { 
+                            take: 1, 
+                            orderBy: { displayOrder: 'asc' }, 
+                            include: { product: true } 
+                        } 
+                    } 
+                } 
+            }
+        });
+        const response = likedCollections.map(like => ({
+            id: like.collection.id,
+            name: like.collection.name,
+            slug: like.collection.slug,
+            author: like.collection.user.username,
+            authorAvatar: like.collection.user.profileImageUrl || `https://placehold.co/100x100/E2E8F0/475569?text=${like.collection.user.username.charAt(0).toUpperCase()}`,
+            coverImage: like.collection.products[0]?.product.imageUrls[0] || `https://placehold.co/400x300/cccccc/333333?text=${encodeURIComponent(like.collection.name)}`
+        }));
+        reply.send(response);
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching liked collections" }); }
+});
+// GET /collections/:collectionId/comments
+server.get('/collections/:collectionId/comments', async (request, reply) => {
+    const { collectionId } = request.params as { collectionId: string };
+    try {
+        const comments = await prisma.comment.findMany({
+            where: { collectionId },
+            orderBy: { createdAt: 'asc' },
+            include: { user: { select: { username: true, profileImageUrl: true } } }
+        });
+        reply.send(comments);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching comments" });
+    }
+});
+
+// --- CREATOR DASHBOARD & COLLECTION MANAGEMENT ---
+server.get('/dashboard/:userId', async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    try {
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return reply.code(404).send({ message: "User not found" });
+
+        const collections = await prisma.collection.findMany({
+            where: { userId },
+            include: { _count: { select: { products: true, likedBy: true } } }
+        });
+        const responseData = collections.map(c => ({
+            id: c.id, name: c.name, slug: c.slug, 
+            productsCount: c._count.products,
+            likes: c._count.likedBy,
+            shares: Math.floor(Math.random() * 100), // Simulated for now
+            username: user.username,
+        }));
+        reply.send({ collections: responseData });
+    } catch (error) { reply.code(500).send({ message: "Error fetching dashboard data" }); }
+});
+
+server.get('/collections/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+        const collection = await prisma.collection.findUnique({
+            where: { id },
+            include: { products: { orderBy: { displayOrder: 'asc' }, include: { product: { include: { brand: true } } } } }
+        });
+        if (!collection) return reply.code(404).send({ message: "Collection not found" });
+        const response = {
+            id: collection.id, name: collection.name,
+            products: collection.products.map(cp => ({ id: cp.product.id, name: cp.product.name, imageUrl: cp.product.imageUrls[0], brand: cp.product.brand?.name || "Brand" }))
+        };
+        reply.send(response);
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching collection details" }); }
+});
+
+server.post('/collections', async (request, reply) => {
+    let { name, products, userId, description, coverImageUrl } = request.body as any;
+    try {
+        // --- VALIDATION STEP ---
+        const productIds = products.map((p: any) => p.id);
+        const existingProductsCount = await prisma.product.count({
+            where: { id: { in: productIds } },
+        });
+
+        if (existingProductsCount !== productIds.length) {
+            return reply.code(400).send({ message: "One or more selected products do not exist. Please refresh and try again." });
+        }
+        // --- END VALIDATION ---
+
+        if (!coverImageUrl && products && products.length > 0) {
+            const firstProduct = await prisma.product.findUnique({ where: { id: products[0].id } });
+            if (firstProduct) coverImageUrl = firstProduct.imageUrls[0];
+        }
+
+        const newCollection = await prisma.collection.create({
+            data: {
+                name, slug: name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, ''), 
+                userId, description, coverImageUrl,
+                products: { create: products.map((p: any, index: number) => ({ productId: p.id, displayOrder: index })) },
+            },
+        });
+        reply.code(201).send(newCollection);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error creating collection" });
+    }
+});
+
+server.delete('/collections/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+        await prisma.collectionProduct.deleteMany({ where: { collectionId: id } });
+        await prisma.click.deleteMany({ where: { collectionId: id } });
+        await prisma.userLikes.deleteMany({ where: { collectionId: id } });
+        await prisma.collection.delete({ where: { id } });
+        reply.code(204).send();
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error deleting collection" }); }
+});
+
+// --- PUBLIC & UNIVERSAL ROUTES ---
+server.get('/products/search', async (request, reply) => {
+    const { q, brandId } = request.query as { q?: string, brandId?: string };
+    try {
+        const products = await prisma.product.findMany({
+            where: {
+                name: {
+                    contains: q || '',
+                    mode: 'insensitive',
+                },
+                // This is the new filter logic
+                brandId: brandId || undefined,
+            },
+            include: { brand: true },
+        });
+        const response = products.map(p => ({
+            id: p.id,
+            name: p.name,
+            brand: p.brand?.name || 'Unknown Brand',
+            imageUrl: p.imageUrls[0],
+        }));
+        return response;
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error searching products" });
+    }
+});
+
+// GET /brands
+server.get('/brands', async (request, reply) => {
+    try {
+        const brands = await prisma.brand.findMany({
+            orderBy: { name: 'asc' }
+        });
+        reply.send(brands);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching brands" });
+    }
+});
+
+server.get('/public/home', async (request, reply) => {
+    try {
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const mapCollection = (c: any) => ({
+            id: c.id, name: c.name, slug: c.slug, author: c.user.username,
+            authorAvatar: c.user.profileImageUrl || `https://placehold.co/100x100/E2E8F0/475569?text=${c.user.username.charAt(0).toUpperCase()}`,
+            coverImage: c.coverImageUrl || c.products[0]?.product.imageUrls[0] || `https://placehold.co/400x300/cccccc/333333?text=${encodeURIComponent(c.name)}`
+        });
+        const newCollections = await prisma.collection.findMany({
+            where: { createdAt: { gte: sevenDaysAgo } }, take: 5, orderBy: { createdAt: 'desc' },
+            include: { user: true, products: { take: 1, orderBy: { displayOrder: 'asc' }, include: { product: true } } }
+        }).then(res => res.map(mapCollection));
+        const trendingCollections = await prisma.collection.findMany({
+            take: 5, orderBy: { likedBy: { _count: 'desc' } },
+            include: { user: true, products: { take: 1, orderBy: { displayOrder: 'asc' }, include: { product: true } } }
+        }).then(res => res.map(mapCollection));
+        reply.send({ new: newCollections, trending: trendingCollections });
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching homepage data" }); }
+});
+
+server.get('/public/collections/:username/:slug', async (request, reply) => {
+    const { username, slug } = request.params as any;
+    try {
+        const collection = await prisma.collection.findFirst({
+            where: { user: { username }, slug },
+            include: { user: true, products: { orderBy: { displayOrder: 'asc' }, include: { product: { include: { brand: true } } } } }
+        });
+        if (!collection) return reply.code(404).send({ message: "Collection not found" });
+        const publicCollection = {
+            id: collection.id, name: collection.name, description: collection.description,
+            author: collection.user.username, authorId: collection.user.id, authorAvatar: collection.user.profileImageUrl || `https://placehold.co/100x100/E2E8F0/475569?text=${collection.user.username.charAt(0).toUpperCase()}`,
+            products: collection.products.map(cp => ({ id: cp.product.id, name: cp.product.name, imageUrl: cp.product.imageUrls[0], brand: cp.product.brand?.name || "Brand", buyUrl: `http://localhost:3001/redirect?collectionId=${collection.id}&productId=${cp.product.id}&affiliateUrl=${encodeURIComponent(cp.product.baseUrl)}` }))
+        };
+        reply.send(publicCollection);
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching public collection" }); }
+});
+
+server.get('/redirect', async (request, reply) => {
+    const { collectionId, productId, affiliateUrl } = request.query as any;
+    const decodedUrl = decodeURIComponent(affiliateUrl);
+
+    if (!collectionId || !productId || !decodedUrl) {
+        return reply.code(400).send({ message: "Missing tracking parameters." });
+    }
+
+    try {
+        // THIS IS THE FIX: We now 'await' the database call.
+        await prisma.click.create({
+            data: {
+                collectionId,
+                productId,
+                userAgent: request.headers['user-agent'] || '',
+                ipAddress: (request.headers['x-forwarded-for'] as string) || request.ip,
+            }
+        });
+    } catch (err) {
+        // If logging fails, we still redirect the user so their experience isn't broken.
+        server.log.error(err, "Failed to log click, but redirecting anyway.");
+    }
+
+    // Now that the click is saved, we can safely redirect.
+    return reply
+        .code(302)
+        .header('Location', decodedUrl)
+        .send();
+});
+
+// --- Start Server ---
+const start = async () => {
+  try { await server.listen({ port: 3001 }); } catch (err) { server.log.error(err); process.exit(1); }
+};
+start();
