@@ -23,7 +23,7 @@ model User {
   profileImageUrl String?
   tier            String       @default("free")
   createdAt       DateTime     @default(now())
-  
+  coupons     Coupon[]
   collections Collection[]
   likes       UserLikes[]
   comments    Comment[]
@@ -31,16 +31,20 @@ model User {
   // Correctly defines the user's relationship to the Follow table
   following   Follow[]     @relation("Followers") // Users this user is following
   followers   Follow[]     @relation("Following") // Users who follow this user
+  brands      Brand[]
 }
+
 
 // 2. brands Table
 model Brand {
   id           String    @id @default(uuid())
-  name         String    @unique // <-- ADD THIS @unique ATTRIBUTE
+  name         String    @unique
   websiteUrl   String?
   affiliateTag String?
   createdAt    DateTime  @default(now())
   products     Product[]
+  userId       String?   
+  user         User?      @relation(fields: [userId], references: [id]) // <-- ADD THIS LINE
 }
 
 // 3. products Table
@@ -61,6 +65,8 @@ model Product {
   clicks          Click[]
 }
 
+
+
 // 4. collections Table
 model Collection {
   id        String              @id @default(uuid())
@@ -77,6 +83,7 @@ model Collection {
   comments Comment[]
 }
 
+
 // 5. collection_products (Junction Table)
 model CollectionProduct {
   collectionId  String
@@ -88,6 +95,7 @@ model CollectionProduct {
 
   @@id([collectionId, productId])
 }
+
 
 // 6. analytics_clicks Table
 model Click {
@@ -129,4 +137,13 @@ model Comment {
 
   user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+}
+model Coupon {
+  id          String   @id @default(uuid())
+  userId      String
+  code        String   @unique
+  description String
+  imageUrl    String
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

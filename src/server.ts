@@ -132,6 +132,34 @@ server.post('/login', async (request, reply) => {
         reply.send(userResponse);
     } catch (error) { server.log.error(error); reply.code(500).send({ message: 'Server error.' }); }
 });
+// POST /auth/social
+server.post('/auth/social', async (request, reply) => {
+    const { email, username, authProviderId, profileImageUrl } = request.body as any;
+
+    if (!email || !authProviderId || !username) {
+        return reply.code(400).send({ message: "Email, username, and authProviderId are required." });
+    }
+
+    try {
+        const user = await prisma.user.upsert({
+            where: { email },
+            update: { authProviderId }, // Update auth provider ID if user exists
+            create: {
+                email,
+                username,
+                authProviderId,
+                profileImageUrl,
+                role: 'SHOPPER', // New social signups default to Shopper
+            },
+        });
+
+        const { authProviderId: _, ...userResponse } = user;
+        reply.send(userResponse);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: 'An internal server error occurred.' });
+    }
+});
 
 server.put('/users/:userId/upgrade-to-creator', async (request, reply) => {
     const { userId } = request.params as { userId: string };
@@ -153,6 +181,45 @@ server.put('/users/:userId/upgrade-to-creator', async (request, reply) => {
     } catch (error) {
         server.log.error(error);
         reply.code(500).send({ message: "Could not upgrade user to creator." });
+    }
+});
+
+// POST /brands/register
+server.post('/brands/register', async (request, reply) => {
+    const { brandName, category, presence, website, email, name } = request.body as any;
+
+    try {
+        // In a real app, we would create a temporary "BrandApplication" model.
+        // For the MVP, we can create a placeholder user and brand.
+        const placeholderEmail = `brand-${Date.now()}@surecart-pending.dev`;
+        const hashedPassword = await bcrypt.hash(`temp_password_${Date.now()}`, 10);
+        
+        const brandUser = await prisma.user.create({
+            data: {
+                email: placeholderEmail,
+                username: brandName.toLowerCase().replace(/\s+/g, ''),
+                authProviderId: hashedPassword,
+                role: 'BRAND',
+                fullName: name,
+            }
+        });
+
+        await prisma.brand.create({
+            data: {
+                name: brandName,
+                websiteUrl: website,
+                userId: brandUser.id,
+                // You can add category and presence to your schema if needed
+            }
+        });
+        
+        // In a real app, you would trigger a confirmation email here.
+        // e.g., await sendBrandConfirmationEmail({ brandName, email, name });
+
+        reply.code(201).send({ message: 'Brand application submitted successfully.' });
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: 'An error occurred while submitting the application.' });
     }
 });
 
@@ -179,23 +246,37 @@ server.delete('/collections/:collectionId/unlike', async (request, reply) => {
         reply.code(200).send({ isLiked: false });
     } catch (error) { server.log.error(error); reply.code(500).send({ message: "Could not unlike collection" }); }
 });
+
+// --- FOLLOW / UNFOLLOW ROUTES ---
+
 server.post('/users/:creatorId/follow', async (request, reply) => {
     const { creatorId } = request.params as { creatorId: string };
     const { userId } = request.body as { userId: string }; // The user who is doing the following
+    
+    if (!userId) return reply.code(400).send({ message: "User ID is required." });
+
     try {
-        await prisma.follow.create({ data: { followerId: userId, followingId: creatorId } });
+        await prisma.follow.create({ 
+            data: { 
+                followerId: userId, 
+                followingId: creatorId 
+            } 
+        });
         reply.code(201).send({ message: 'Followed successfully' });
-    } catch (error) { reply.code(500).send({ message: 'Error following user' }); }
+    } catch (error: any) {
+        if (error.code === 'P2002') { // Handles cases where the user already follows the creator
+            return reply.code(409).send({ message: 'Already following' });
+        }
+        server.log.error(error);
+        reply.code(500).send({ message: 'Error following user' });
+    }
 });
-// Add this new route to your server.ts file
 
 server.delete('/users/:creatorId/unfollow', async (request, reply) => {
     const { creatorId } = request.params as { creatorId: string };
-    const { userId } = request.body as { userId: string }; // The user who is doing the unfollowing
+    const { userId } = request.body as { userId: string };
     
-    if (!userId) {
-        return reply.code(400).send({ message: "User ID is required." });
-    }
+    if (!userId) return reply.code(400).send({ message: "User ID is required." });
 
     try {
         await prisma.follow.delete({
@@ -206,10 +287,28 @@ server.delete('/users/:creatorId/unfollow', async (request, reply) => {
                 },
             },
         });
-        reply.code(204).send(); // 204 No Content is standard for a successful DELETE
+        reply.code(204).send();
     } catch (error) {
         server.log.error(error);
         reply.code(500).send({ message: "Could not unfollow user." });
+    }
+});
+
+server.get('/users/:userId/follow-status/:creatorId', async (request, reply) => {
+    const { userId, creatorId } = request.params as { userId: string, creatorId: string };
+    try {
+        const follow = await prisma.follow.findUnique({ 
+            where: { 
+                followerId_followingId: { 
+                    followerId: userId, 
+                    followingId: creatorId 
+                } 
+            } 
+        });
+        reply.send({ isFollowing: !!follow });
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching follow status" });
     }
 });
 
@@ -359,6 +458,96 @@ server.delete('/collections/:id', async (request, reply) => {
         reply.code(204).send();
     } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error deleting collection" }); }
 });
+// PUT /collections/:id
+server.put('/collections/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { name, products } = request.body as any; // Add description, coverImageUrl etc. as needed
+
+    try {
+        // First, delete existing product connections for this collection
+        await prisma.collectionProduct.deleteMany({
+            where: { collectionId: id },
+        });
+
+        // Then, update the collection and create the new product connections
+        const updatedCollection = await prisma.collection.update({
+            where: { id },
+            data: {
+                name,
+                slug: name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, ''),
+                products: {
+                    create: products.map((p: any, index: number) => ({
+                        productId: p.id,
+                        displayOrder: index,
+                    })),
+                },
+            },
+        });
+        reply.send(updatedCollection);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error updating collection" });
+    }
+});
+// GET /brands/:brandId/dashboard
+server.get('/brands/:brandId/dashboard', async (request, reply) => {
+    const { brandId } = request.params as { brandId: string };
+    try {
+        // Find all collections that feature this brand's products
+        const collectionsWithBrandProducts = await prisma.collection.findMany({
+            where: {
+                products: { some: { product: { brandId: brandId } } }
+            },
+            include: {
+                user: true, // The creator of the collection
+                _count: { select: { clicks: true } }
+            }
+        });
+
+        const totalClicks = collectionsWithBrandProducts.reduce((sum, col) => sum + col._count.clicks, 0);
+        
+        const topCreators = collectionsWithBrandProducts.map(col => ({
+            id: col.user.id,
+            username: col.user.username,
+            profileImageUrl: col.user.profileImageUrl,
+            collectionName: col.name,
+            clicks: col._count.clicks,
+        })).sort((a, b) => b.clicks - a.clicks).slice(0, 5); // Top 5
+
+        reply.send({
+            summary: {
+                totalClicks,
+                totalCollections: collectionsWithBrandProducts.length,
+                topCreator: topCreators[0] || null
+            },
+            topCreators
+        });
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching brand dashboard" });
+    }
+});
+// GET /users/:userId/rewards
+server.get('/users/:userId/rewards', async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    try {
+        const coupons = await prisma.coupon.findMany({
+            where: { userId },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        // The wallet balance would come from a separate system in a real app
+        const wallet = {
+            balance: 1250.75, // Simulated data
+            currency: 'INR'
+        };
+
+        reply.send({ wallet, coupons });
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching rewards" });
+    }
+});
 
 // --- PUBLIC & UNIVERSAL ROUTES ---
 server.get('/products/search', async (request, reply) => {
@@ -400,8 +589,31 @@ server.get('/brands', async (request, reply) => {
         reply.code(500).send({ message: "Error fetching brands" });
     }
 });
-
+// NEW: This powers the Pinterest-style infinite feed on the homepage
 server.get('/public/home', async (request, reply) => {
+    try {
+        const collections = await prisma.collection.findMany({
+            take: 50, // A reasonable limit for the initial feed
+            orderBy: { createdAt: 'desc' },
+            include: {
+                user: { select: { username: true, profileImageUrl: true } },
+                products: { take: 1, orderBy: { displayOrder: 'asc' }, include: { product: { select: { imageUrls: true } } } }
+            }
+        });
+        const response = collections.map(c => ({
+            id: c.id, name: c.name, slug: c.slug, author: c.user.username,
+            authorAvatar: c.user.profileImageUrl || `https://placehold.co/100x100/E2E8F0/475569?text=${c.user.username.charAt(0).toUpperCase()}`,
+            coverImage: c.coverImageUrl || c.products[0]?.product.imageUrls[0] || `https://placehold.co/400x300/cccccc/333333?text=${encodeURIComponent(c.name)}`
+        }));
+        reply.send(response);
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error fetching homepage data" });
+    }
+});
+
+// NEW: This now powers the categorized Explore page
+server.get('/public/explore', async (request, reply) => {
     try {
         const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
         const mapCollection = (c: any) => ({
@@ -418,7 +630,7 @@ server.get('/public/home', async (request, reply) => {
             include: { user: true, products: { take: 1, orderBy: { displayOrder: 'asc' }, include: { product: true } } }
         }).then(res => res.map(mapCollection));
         reply.send({ new: newCollections, trending: trendingCollections });
-    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching homepage data" }); }
+    } catch (error) { server.log.error(error); reply.code(500).send({ message: "Error fetching explore data" }); }
 });
 
 server.get('/public/collections/:username/:slug', async (request, reply) => {
