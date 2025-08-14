@@ -27,11 +27,13 @@ model User {
   collections Collection[]
   likes       UserLikes[]
   comments    Comment[]
+  transactions Transaction[]
   
   // Correctly defines the user's relationship to the Follow table
   following   Follow[]     @relation("Followers") // Users this user is following
   followers   Follow[]     @relation("Following") // Users who follow this user
   brands      Brand[]
+  views       CollectionView[]
 }
 
 
@@ -81,6 +83,7 @@ model Collection {
   likedBy UserLikes[]
   description String?
   comments Comment[]
+  views CollectionView[] // <-- ADD THIS LINE
 }
 
 
@@ -146,4 +149,26 @@ model Coupon {
   imageUrl    String
   createdAt   DateTime @default(now())
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+model Transaction {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type            String   // 'COMMISSION', 'WITHDRAWAL', 'BONUS'
+  status          String   // 'PENDING', 'APPROVED', 'REJECTED'
+  amount          Float
+  currency        String
+  description     String
+  createdAt       DateTime @default(now())
+}
+model CollectionView {
+  id           String   @id @default(uuid())
+  collectionId String
+  collection   Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  
+  // We can optionally link this to a logged-in user
+  userId       String?
+  user         User?      @relation(fields: [userId], references: [id])
+
+  createdAt    DateTime @default(now())
 }

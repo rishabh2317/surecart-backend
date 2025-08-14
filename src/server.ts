@@ -3,92 +3,95 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const server = Fastify({ logger: true });
 const prisma = new PrismaClient();
 const SALT_ROUNDS = 10;
+// Add this at the top of your server.ts file, with other variables
+let aiApiCallCount = 0;
+const AI_API_CALL_LIMIT = 10; // Our own internal monthly limit
 
 server.register(cors, { 
     origin: '*', // In production, you would change this to your frontend's domain
     methods: ['GET', 'POST', 'PUT', 'DELETE'], // Explicitly allow the DELETE method
   });
 // --- NEW ANALYTICS ENDPOINT ---
+// Find and replace the existing /dashboard/:userId/analytics route
+
+// Find and replace the entire /dashboard/:userId/analytics route with this version
+
 server.get('/dashboard/:userId/analytics', async (request, reply) => {
     const { userId } = request.params as { userId: string };
     try {
-        // 1. Fetch all collections for the user
-        const collections = await prisma.collection.findMany({
-            where: { userId },
-            include: {
-                _count: { select: { products: true, clicks: true, likedBy: true } },
-            },
-        });
-
-        // 2. Simulate time-series data for the main chart
-        // 2. Fetch real click data for the last 7 days
+        // --- 1. Fetch Real Data ---
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-        const clicksByDay = await prisma.click.groupBy({
-            by: ['createdAt'],
+        const collections = await prisma.collection.findMany({
+            where: { userId },
+            include: { _count: { select: { products: true, clicks: true, likedBy: true } } },
+        });
+        const totalImpressions = await prisma.collectionView.count({
             where: {
                 collection: {
                     userId: userId,
                 },
-                createdAt: {
-                    gte: sevenDaysAgo,
-                },
             },
-            _count: {
-                id: true,
-            },
-            orderBy: {
-                createdAt: 'asc',
-            }
         });
 
-        // Format the data for the chart
-        const dateMap = new Map<string, number>();
-        for (let i = 0; i < 7; i++) {
+        const creator = await prisma.user.findUnique({
+            where: { id: userId },
+            include: { _count: { select: { followers: true } } }
+        });
+
+        // --- 2. Aggregate Real Data by Day ---
+        const clicksByDayRaw = await prisma.click.groupBy({ by: ['createdAt'], where: { collection: { userId }, createdAt: { gte: sevenDaysAgo } }, _count: { _all: true } });
+        const likesByDayRaw = await prisma.userLikes.groupBy({ by: ['createdAt'], where: { collection: { userId }, createdAt: { gte: sevenDaysAgo } }, _count: { _all: true } });
+        
+        // --- 3. Process Data for Time-Series Chart ---
+        const dateMap = new Map<string, { Clicks: number, Likes: number, Engagements: number }>();
+        for (let i = 6; i >= 0; i--) {
             const d = new Date();
             d.setDate(d.getDate() - i);
-            const key = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            dateMap.set(key, 0);
+            const key = d.toISOString().split('T')[0];
+            dateMap.set(key, { Clicks: 0, Likes: 0, Engagements: 0 });
         }
 
-        clicksByDay.forEach(row => {
-            const key = new Date(row.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            if (dateMap.has(key)) {
-                dateMap.set(key, (dateMap.get(key) || 0) + row._count.id);
-            }
+        clicksByDayRaw.forEach(row => {
+            const key = new Date(row.createdAt).toISOString().split('T')[0];
+            if (dateMap.has(key)) dateMap.get(key)!.Clicks += row._count._all;
+        });
+        likesByDayRaw.forEach(row => {
+            const key = new Date(row.createdAt).toISOString().split('T')[0];
+            if (dateMap.has(key)) dateMap.get(key)!.Likes += row._count._all;
         });
         
-        const clicksOverTime = Array.from(dateMap.entries()).map(([date, clicks]) => ({ date, clicks })).reverse();
+        dateMap.forEach(value => value.Engagements = value.Clicks + value.Likes);
 
-        // 3. Aggregate overall stats (simulated earnings/conversions)
+        const performanceOverTime = Array.from(dateMap.entries()).map(([date, metrics]) => ({ 
+            date: new Date(date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }), 
+            ...metrics 
+        }));
+
+        // --- 4. Calculate Summary and Top Collections ---
         const totalClicks = collections.reduce((sum, col) => sum + col._count.clicks, 0);
-        const totalEarnings = totalClicks * 0.25; // Simulate earnings based on clicks
-        const totalConversions = Math.floor(totalClicks / 20); // Simulate a 5% conversion rate
+        const totalLikes = collections.reduce((sum, col) => sum + col._count.likedBy, 0);
+        
+        const topCollections = collections.map(c => ({
+            id: c.id, name: c.name, clicks: c._count.clicks, likes: c._count.likedBy,
+            shares: Math.floor(c._count.clicks / 10 + c._count.likedBy * 2),
+        })).sort((a, b) => b.clicks - a.clicks).slice(0, 5);
 
-        // 4. Format collection data for the table
-        const collectionsPerformance = collections.map(c => ({
-            id: c.id,
-            name: c.name,
-            clicks: c._count.clicks,
-            likes: c._count.likedBy,
-            shares: Math.floor(Math.random() * 100), // Simulated
-            earnings: c._count.clicks * 0.25, // Simulated
-        })).sort((a, b) => b.earnings - a.earnings);
-
+        // --- 5. Send Final Payload ---
         reply.send({
             summary: {
-                totalClicks,
-                totalEarnings,
-                totalConversions,
-                avgConversionRate: 5.12, // Mocked
+                totalAudience: totalImpressions, engagements: totalClicks + totalLikes,
+                outboundClicks: totalClicks, saves: totalLikes, totalLikes: totalLikes,
+                followers: creator?._count.followers || 0,
             },
-            clicksOverTime: last7Days,
-            topCollections: collectionsPerformance,
+            performanceOverTime: performanceOverTime,
+            topCollections: topCollections,
         });
 
     } catch (error) {
@@ -377,6 +380,38 @@ server.get('/collections/:collectionId/comments', async (request, reply) => {
     }
 });
 
+// POST /products/ask-ai
+server.post('/products/ask-ai', async (request, reply) => {
+    const { productName } = request.body as { productName: string };
+    if (aiApiCallCount >= AI_API_CALL_LIMIT) {
+        return reply.code(429).send({ message: "This feature is temporarily unavailable due to high demand. Please try again later." });
+    }
+    // This is a critical check for production
+    if (!process.env.GEMINI_API_KEY) {
+        return reply.code(500).send({ message: "AI service is not configured." });
+    }
+    
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash"});
+
+    const prompt = `You are a helpful e-commerce assistant. Your goal is to provide a balanced and concise summary of public reviews for a product. Based on common knowledge and reviews for the product "${productName}", provide a summary with: 
+- Three bullet points for "Pros" (what people love).
+- Three bullet points for "Cons" (common complaints or drawbacks).
+- A one-sentence "Best For" recommendation.
+Keep the language neutral and objective.`;
+
+    try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        // Increment our counter after a successful call
+        aiApiCallCount++;
+        reply.send({ summary: text });
+    } catch (error) {
+        server.log.error(error, "Error fetching AI summary");
+        reply.code(500).send({ message: "Could not generate AI summary." });
+    }
+});
 // --- CREATOR DASHBOARD & COLLECTION MANAGEMENT ---
 server.get('/dashboard/:userId', async (request, reply) => {
     const { userId } = request.params as { userId: string };
@@ -528,21 +563,28 @@ server.get('/brands/:brandId/dashboard', async (request, reply) => {
     }
 });
 // GET /users/:userId/rewards
+// GET /users/:userId/rewards
 server.get('/users/:userId/rewards', async (request, reply) => {
     const { userId } = request.params as { userId: string };
     try {
-        const coupons = await prisma.coupon.findMany({
+        const coupons = await prisma.coupon.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } });
+        
+        const transactions = await prisma.transaction.findMany({
             where: { userId },
             orderBy: { createdAt: 'desc' }
         });
 
-        // The wallet balance would come from a separate system in a real app
+        // Calculate the wallet balance from approved transactions
+        const balance = transactions
+            .filter(t => t.status === 'APPROVED')
+            .reduce((sum, t) => sum + t.amount, 0);
+
         const wallet = {
-            balance: 1250.75, // Simulated data
+            balance: balance,
             currency: 'INR'
         };
 
-        reply.send({ wallet, coupons });
+        reply.send({ wallet, coupons, transactions });
     } catch (error) {
         server.log.error(error);
         reply.code(500).send({ message: "Error fetching rewards" });
@@ -574,6 +616,25 @@ server.get('/products/search', async (request, reply) => {
     } catch (error) {
         server.log.error(error);
         reply.code(500).send({ message: "Error searching products" });
+    }
+});
+
+// POST /public/collections/:collectionId/view
+server.post('/public/collections/:collectionId/view', async (request, reply) => {
+    const { collectionId } = request.params as { collectionId: string };
+    const { userId } = request.body as { userId?: string }; // userId is optional
+
+    try {
+        await prisma.collectionView.create({
+            data: {
+                collectionId,
+                userId: userId || null, // Handle anonymous views
+            }
+        });
+        reply.code(201).send({ message: "View logged successfully." });
+    } catch (error) {
+        server.log.error(error);
+        reply.code(500).send({ message: "Error logging view" });
     }
 });
 
